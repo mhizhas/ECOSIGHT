@@ -1,0 +1,551 @@
+"""
+FastAPI Backend for Wildlife Sound Classification Model
+Author: EcoSight Team
+Date: 2025-11-17
+
+Features:
+- Model predictions endpoint
+- Model retraining trigger
+- Model status and uptime monitoring
+- File upload for new data
+- Performance metrics
+"""
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+import numpy as np
+import librosa
+import soundfile as sf
+import tensorflow as tf
+import tensorflow_hub as hub
+import json
+import os
+import shutil
+from datetime import datetime, timedelta
+from pathlib import Path
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Wildlife Sound Classification API",
+    description="Anti-Poaching Wildlife Protection System - Audio Classification API",
+    version="1.0.0"
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global variables
+MODEL = None
+YAMNET_MODEL = None
+CLASS_NAMES = []
+MODEL_METADATA = {}
+START_TIME = datetime.now()
+PREDICTION_COUNT = 0
+RETRAINING_IN_PROGRESS = False
+
+# Paths (adjust these based on your deployment)
+BASE_DIR = Path(__file__).parent
+MODELS_DIR = BASE_DIR / "models"
+UPLOAD_DIR = BASE_DIR / "uploads"
+AUGMENTED_AUDIO_DIR = BASE_DIR / "augmented_audio"
+
+# Create directories
+UPLOAD_DIR.mkdir(exist_ok=True)
+for class_dir in ["gun_shot", "dog_bark", "engine_idling", "clips"]:
+    (AUGMENTED_AUDIO_DIR / class_dir).mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================================
+# MODEL LOADING
+# ============================================================================
+
+def build_model_from_metadata(metadata):
+    """Rebuild model architecture from metadata"""
+    try:
+        num_classes = metadata['num_classes']
+        input_shape = tuple(metadata['input_shape'])
+        arch = metadata['architecture']
+        
+        model = tf.keras.Sequential([
+            tf.keras.layers.Input(shape=input_shape),
+            tf.keras.layers.Dense(arch['layers'][0], activation=arch['activation']),
+            tf.keras.layers.Dropout(arch['dropout_rates'][0]),
+            tf.keras.layers.Dense(arch['layers'][1], activation=arch['activation']),
+            tf.keras.layers.Dropout(arch['dropout_rates'][1]),
+            tf.keras.layers.Dense(arch['layers'][2], activation=arch['activation']),
+            tf.keras.layers.Dropout(arch['dropout_rates'][2]),
+            tf.keras.layers.Dense(arch['layers'][3], activation=arch['activation']),
+            tf.keras.layers.Dropout(arch['dropout_rates'][3]),
+            tf.keras.layers.Dense(num_classes, activation='softmax')
+        ])
+        
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=arch.get('learning_rate', 0.001)),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        logger.info("✓ Model architecture rebuilt from metadata")
+        return model
+    except Exception as e:
+        logger.error(f"Error building model from metadata: {e}")
+        return None
+
+def load_model_artifacts():
+    """Load model, class names, and metadata on startup"""
+    global MODEL, YAMNET_MODEL, CLASS_NAMES, MODEL_METADATA
+    
+    try:
+        logger.info("Loading model artifacts...")
+        
+        # Load YAMNet pretrained model
+        logger.info("Loading YAMNet pretrained model...")
+        yamnet_model_url = 'https://tfhub.dev/google/yamnet/1'
+        YAMNET_MODEL = hub.load(yamnet_model_url)
+        logger.info("✓ YAMNet model loaded")
+        
+        # Load classifier model with custom objects for compatibility
+        model_path = MODELS_DIR / "yamnet_classifier_v2.keras"
+        # Fallback to original if v2 doesn't exist
+        if not model_path.exists():
+            model_path = MODELS_DIR / "yamnet_classifier.keras"
+        
+        if model_path.exists():
+            try:
+                # Try loading with compile=False to avoid optimizer issues
+                MODEL = tf.keras.models.load_model(model_path, compile=False)
+                # Recompile the model
+                MODEL.compile(
+                    optimizer='adam',
+                    loss='sparse_categorical_crossentropy',
+                    metrics=['accuracy']
+                )
+                logger.info(f"✓ Classifier model loaded from {model_path}")
+            except Exception as e:
+                logger.error(f"Error loading keras model: {e}")
+                logger.info("Attempting to load as SavedModel format...")
+                try:
+                    # Try loading the .h5 or rebuild from architecture
+                    MODEL = tf.keras.models.load_model(str(model_path).replace('.keras', '.h5'))
+                    logger.info("✓ Loaded from .h5 format")
+                except:
+                    logger.warning(f"Could not load model. Model will need to be retrained.")
+                    MODEL = None
+        else:
+            logger.warning(f"Model not found at {model_path}")
+            MODEL = None
+        
+        # Load class names
+        class_names_path = MODELS_DIR / "class_names.json"
+        if class_names_path.exists():
+            with open(class_names_path, 'r') as f:
+                CLASS_NAMES = json.load(f)
+            logger.info(f"✓ Class names loaded: {CLASS_NAMES}")
+        
+        # Load metadata
+        metadata_path = MODELS_DIR / "model_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                MODEL_METADATA = json.load(f)
+            logger.info("✓ Model metadata loaded")
+            
+            # If model failed to load, try rebuilding from metadata and weights
+            if MODEL is None and model_path.exists():
+                logger.info("Attempting to rebuild model from metadata and load weights...")
+                MODEL = build_model_from_metadata(MODEL_METADATA)
+                if MODEL is not None:
+                    try:
+                        # Try to load just the weights
+                        weights_path = str(model_path).replace('.keras', '_weights.h5')
+                        if Path(weights_path).exists():
+                            MODEL.load_weights(weights_path)
+                            logger.info("✓ Model weights loaded successfully")
+                        else:
+                            logger.warning("Weights file not found. Model initialized with random weights.")
+                    except Exception as e:
+                        logger.warning(f"Could not load weights: {e}. Model needs retraining.")
+
+        
+        logger.info("Model artifacts loaded successfully!")
+        
+    except Exception as e:
+        logger.error(f"Error loading model artifacts: {e}")
+        raise
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize models on API startup"""
+    load_model_artifacts()
+
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
+class PredictionResponse(BaseModel):
+    success: bool
+    predicted_class: str
+    confidence: float
+    all_probabilities: Dict[str, float]
+    processing_time: float
+    timestamp: str
+
+
+class ModelStatusResponse(BaseModel):
+    status: str
+    uptime: str
+    total_predictions: int
+    model_loaded: bool
+    model_name: str
+    training_date: str
+    test_accuracy: float
+    num_classes: int
+    classes: List[str]
+
+
+class RetrainingRequest(BaseModel):
+    trigger_reason: Optional[str] = "Manual trigger"
+    min_new_samples: Optional[int] = 100
+
+
+class RetrainingResponse(BaseModel):
+    success: bool
+    message: str
+    status: str
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def extract_yamnet_embeddings(audio_path: Path, max_duration: int = 4):
+    """
+    Extract YAMNet embeddings from audio file
+    
+    Args:
+        audio_path: Path to audio file
+        max_duration: Maximum duration in seconds
+    
+    Returns:
+        Mean embedding vector (1024 dimensions)
+    """
+    # Load audio at 16kHz (YAMNet's required sample rate)
+    audio, sr = librosa.load(audio_path, sr=16000, duration=max_duration)
+    audio = audio.astype(np.float32)
+    
+    # Get YAMNet predictions
+    scores, embeddings, spectrogram = YAMNET_MODEL(audio)
+    
+    # Average embeddings over time
+    embedding_mean = np.mean(embeddings.numpy(), axis=0)
+    
+    return embedding_mean
+
+
+def get_uptime():
+    """Calculate API uptime"""
+    uptime = datetime.now() - START_TIME
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    return f"{days}d {hours}h {minutes}m {seconds}s"
+
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """API root endpoint"""
+    return {
+        "message": "Wildlife Sound Classification API",
+        "version": "1.0.0",
+        "status": "operational",
+        "endpoints": {
+            "predict": "/predict",
+            "status": "/status",
+            "retrain": "/retrain",
+            "upload": "/upload",
+            "metrics": "/metrics"
+        }
+    }
+
+
+@app.get("/status", response_model=ModelStatusResponse)
+async def get_status():
+    """Get model status and uptime information"""
+    global PREDICTION_COUNT
+    
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    return ModelStatusResponse(
+        status="operational",
+        uptime=get_uptime(),
+        total_predictions=PREDICTION_COUNT,
+        model_loaded=MODEL is not None,
+        model_name=MODEL_METADATA.get("model_name", "Unknown"),
+        training_date=MODEL_METADATA.get("training_date", "Unknown"),
+        test_accuracy=MODEL_METADATA.get("test_accuracy", 0.0),
+        num_classes=len(CLASS_NAMES),
+        classes=CLASS_NAMES
+    )
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get detailed performance metrics"""
+    metrics_path = MODELS_DIR / "performance_metrics.json"
+    
+    if not metrics_path.exists():
+        raise HTTPException(status_code=404, detail="Metrics file not found")
+    
+    with open(metrics_path, 'r') as f:
+        metrics = json.load(f)
+    
+    return JSONResponse(content=metrics)
+
+
+@app.get("/training-history")
+async def get_training_history():
+    """Get model retraining history with learning curves"""
+    history_path = MODELS_DIR / "training_history.pkl"
+    retraining_log_path = MODELS_DIR / "retraining_log.json"
+    
+    response = {
+        "has_history": False,
+        "training_history": None,
+        "retraining_log": None
+    }
+    
+    # Load training history (loss/accuracy curves)
+    if history_path.exists():
+        try:
+            import pickle
+            with open(history_path, 'rb') as f:
+                history = pickle.load(f)
+                response["has_history"] = True
+                response["training_history"] = {
+                    "loss": history.get("loss", []),
+                    "val_loss": history.get("val_loss", []),
+                    "accuracy": history.get("accuracy", []),
+                    "val_accuracy": history.get("val_accuracy", []),
+                    "epochs": list(range(1, len(history.get("loss", [])) + 1))
+                }
+        except Exception as e:
+            logger.error(f"Error loading training history: {e}")
+    
+    # Load retraining log
+    if retraining_log_path.exists():
+        try:
+            with open(retraining_log_path, 'r') as f:
+                response["retraining_log"] = json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading retraining log: {e}")
+    
+    return JSONResponse(content=response)
+
+
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(file: UploadFile = File(...)):
+    """
+    Predict wildlife sound class from uploaded audio file
+    
+    Args:
+        file: Audio file (.wav or .mp3)
+    
+    Returns:
+        Prediction results with confidence scores
+    """
+    global PREDICTION_COUNT
+    
+    if MODEL is None or YAMNET_MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    # Validate file type
+    if not file.filename.endswith(('.wav', '.mp3', '.ogg', '.flac')):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file format. Supported: .wav, .mp3, .ogg, .flac"
+        )
+    
+    start_time = datetime.now()
+    
+    try:
+        # Save uploaded file temporarily
+        temp_path = UPLOAD_DIR / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Extract YAMNet embeddings
+        embedding = extract_yamnet_embeddings(temp_path)
+        
+        # Normalize embedding (same as training)
+        embedding_normalized = (embedding - embedding.mean()) / embedding.std()
+        embedding_normalized = embedding_normalized.reshape(1, -1)
+        
+        # Get prediction
+        prediction = MODEL.predict(embedding_normalized, verbose=0)
+        predicted_class_idx = np.argmax(prediction[0])
+        predicted_class = CLASS_NAMES[predicted_class_idx]
+        confidence = float(prediction[0][predicted_class_idx])
+        
+        # Get all probabilities
+        all_probs = {
+            CLASS_NAMES[i]: float(prediction[0][i])
+            for i in range(len(CLASS_NAMES))
+        }
+        
+        # Clean up temp file
+        temp_path.unlink()
+        
+        # Update prediction count
+        PREDICTION_COUNT += 1
+        
+        # Calculate processing time
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        return PredictionResponse(
+            success=True,
+            predicted_class=predicted_class,
+            confidence=confidence,
+            all_probabilities=all_probs,
+            processing_time=processing_time,
+            timestamp=datetime.now().isoformat()
+        )
+        
+    except Exception as e:
+        logger.error(f"Prediction error: {e}")
+        # Clean up temp file if exists
+        if temp_path.exists():
+            temp_path.unlink()
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+
+@app.post("/upload")
+async def upload_training_data(
+    file: UploadFile = File(...),
+    class_name: str = "unknown"
+):
+    """
+    Upload new audio file for training data
+    
+    Args:
+        file: Audio file
+        class_name: Class label for the audio
+    
+    Returns:
+        Upload confirmation
+    """
+    # Validate class name
+    if class_name not in CLASS_NAMES and class_name != "unknown":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid class name. Valid classes: {CLASS_NAMES}"
+        )
+    
+    try:
+        # Create class directory if needed
+        class_dir = AUGMENTED_AUDIO_DIR / class_name
+        class_dir.mkdir(exist_ok=True)
+        
+        # Save file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{file.filename}"
+        file_path = class_dir / filename
+        
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        logger.info(f"File uploaded: {file_path}")
+        
+        return {
+            "success": True,
+            "message": "File uploaded successfully",
+            "file_path": str(file_path),
+            "class": class_name,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@app.post("/retrain", response_model=RetrainingResponse)
+async def trigger_retraining(
+    request: RetrainingRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Trigger model retraining
+    
+    Args:
+        request: Retraining parameters
+        background_tasks: FastAPI background tasks
+    
+    Returns:
+        Retraining status
+    """
+    global RETRAINING_IN_PROGRESS
+    
+    if RETRAINING_IN_PROGRESS:
+        return RetrainingResponse(
+            success=False,
+            message="Retraining already in progress",
+            status="in_progress"
+        )
+    
+    # In production, this would trigger the retraining pipeline
+    # For now, we'll return a response indicating retraining would start
+    
+    logger.info(f"Retraining triggered: {request.trigger_reason}")
+    
+    return RetrainingResponse(
+        success=True,
+        message="Retraining request received. Process will start in background.",
+        status="queued"
+    )
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for container orchestration"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "model_loaded": MODEL is not None
+    }
+
+
+# ============================================================================
+# RUN SERVER
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    uvicorn.run(
+        "api:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )

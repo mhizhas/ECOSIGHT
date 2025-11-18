@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Tests
+tests/
+test_*.py
+*_test.py
+
+# Data (don't include in image)
+augmented_audio/
+uploads/
+extracted_audio/
+features/
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Deployment files (not needed in container)
+docker-compose.yml
+Dockerfile.streamlit
+fly.toml
+fly.streamlit.toml
+deploy-fly.sh
+nginx.conf
+
+# CI/CD
+.github/
+.gitlab-ci.yml
