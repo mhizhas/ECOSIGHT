@@ -1,0 +1,55 @@
+services:
+  # FastAPI Backend Service
+  - type: web
+    name: ecosight-api
+    runtime: docker
+    dockerfilePath: ./deployment/Dockerfile
+    dockerContext: .
+    region: oregon
+    plan: starter
+    branch: main
+    healthCheckPath: /status
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: PYTHONUNBUFFERED
+        value: 1
+      - key: MODEL_PATH
+        value: /app/models/yamnet_classifier_v2.keras
+      - key: UPLOAD_DIR
+        value: /app/uploads
+      - key: AUGMENTED_AUDIO_DIR
+        value: /app/augmented_audio
+    disk:
+      name: ecosight-data
+      mountPath: /app
+      sizeGB: 10
+    autoDeploy: true
+
+  # Streamlit UI Service
+  - type: web
+    name: ecosight-ui
+    runtime: docker
+    dockerfilePath: ./deployment/Dockerfile.streamlit
+    dockerContext: .
+    region: oregon
+    plan: starter
+    branch: main
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PORT
+        value: 8501
+      - key: API_URL
+        fromService:
+          type: web
+          name: ecosight-api
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: STREAMLIT_SERVER_PORT
+        value: 8501
+      - key: STREAMLIT_SERVER_ADDRESS
+        value: 0.0.0.0
+      - key: STREAMLIT_SERVER_HEADLESS
+        value: true
+      - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+        value: false
+    autoDeploy: true

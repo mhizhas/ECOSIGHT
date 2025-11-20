@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import json
 import time
+import os
 from pathlib import Path
 
 # Page configuration
@@ -30,8 +31,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# API Configuration
-API_URL = "http://localhost:8000"  # Change this for production
+# API Configuration - Use environment variable or default to localhost
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 # Custom CSS
 st.markdown("""
@@ -284,7 +285,7 @@ if page == "🏠 Dashboard":
                         "Precision": "{:.4f}",
                         "Recall": "{:.4f}",
                         "F1-Score": "{:.4f}"
-                    }).background_gradient(subset=["Precision", "Recall", "F1-Score"], cmap="Greens"),
+                    }),
                     use_container_width=True
                 )
                 

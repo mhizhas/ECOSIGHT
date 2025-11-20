@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict
+import sys
 import numpy as np
 import librosa
 import soundfile as sf
@@ -513,15 +514,57 @@ async def trigger_retraining(
             status="in_progress"
         )
     
-    # In production, this would trigger the retraining pipeline
-    # For now, we'll return a response indicating retraining would start
+    # Start retraining in background
+    def run_retraining():
+        global RETRAINING_IN_PROGRESS, MODEL
+        RETRAINING_IN_PROGRESS = True
+        
+        try:
+            import subprocess
+            
+            logger.info(f"Starting retraining: {request.trigger_reason}")
+            
+            # Run the retraining script (it's copied to /app in Docker)
+            script_path = Path("/app/retrain_model.py")
+            
+            result = subprocess.run(
+                [sys.executable, str(script_path)],
+                capture_output=True,
+                text=True,
+                timeout=3600  # 1 hour timeout
+            )
+            
+            if result.returncode == 0:
+                logger.info("✓ Retraining completed successfully")
+                logger.info(result.stdout)
+                
+                # Reload the model
+                model_path = MODELS_DIR / "yamnet_classifier_v2.keras"
+                if model_path.exists():
+                    MODEL = tf.keras.models.load_model(model_path, compile=False)
+                    MODEL.compile(
+                        optimizer='adam',
+                        loss='sparse_categorical_crossentropy',
+                        metrics=['accuracy']
+                    )
+                    logger.info("✓ New model loaded successfully")
+            else:
+                logger.error(f"Retraining failed: {result.stderr}")
+                
+        except Exception as e:
+            logger.error(f"Retraining error: {e}")
+        finally:
+            RETRAINING_IN_PROGRESS = False
+    
+    # Add to background tasks
+    background_tasks.add_task(run_retraining)
     
     logger.info(f"Retraining triggered: {request.trigger_reason}")
     
     return RetrainingResponse(
         success=True,
-        message="Retraining request received. Process will start in background.",
-        status="queued"
+        message="Retraining started in background. Check logs for progress.",
+        status="running"
     )
 
 
