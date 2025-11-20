@@ -113,11 +113,16 @@ def load_model_artifacts():
     try:
         logger.info("Loading model artifacts...")
         
-        # Load YAMNet pretrained model
+        # Load YAMNet pretrained model with timeout handling
         logger.info("Loading YAMNet pretrained model...")
-        yamnet_model_url = 'https://tfhub.dev/google/yamnet/1'
-        YAMNET_MODEL = hub.load(yamnet_model_url)
-        logger.info("✓ YAMNet model loaded")
+        try:
+            yamnet_model_url = 'https://tfhub.dev/google/yamnet/1'
+            YAMNET_MODEL = hub.load(yamnet_model_url)
+            logger.info("✓ YAMNet model loaded")
+        except Exception as e:
+            logger.error(f"Failed to load YAMNet: {e}")
+            logger.warning("YAMNet will be loaded on first prediction request")
+            YAMNET_MODEL = None
         
         # Load classifier model with custom objects for compatibility
         model_path = MODELS_DIR / "yamnet_classifier_v2.keras"
@@ -185,13 +190,19 @@ def load_model_artifacts():
         
     except Exception as e:
         logger.error(f"Error loading model artifacts: {e}")
-        raise
+        logger.error(f"Stack trace:", exc_info=True)
+        # Don't crash the API - allow it to start even if model loading fails
+        logger.warning("API starting without model loaded. Model will need to be retrained.")
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize models on API startup"""
-    load_model_artifacts()
+    try:
+        load_model_artifacts()
+    except Exception as e:
+        logger.error(f"Startup error: {e}", exc_info=True)
+        logger.warning("API starting with limited functionality")
 
 
 # ============================================================================
@@ -245,6 +256,19 @@ def extract_yamnet_embeddings(audio_path: Path, max_duration: int = 4):
     Returns:
         Mean embedding vector (1024 dimensions)
     """
+    global YAMNET_MODEL
+    
+    # Lazy load YAMNet if not already loaded
+    if YAMNET_MODEL is None:
+        logger.info("Loading YAMNet model (lazy load)...")
+        try:
+            yamnet_model_url = 'https://tfhub.dev/google/yamnet/1'
+            YAMNET_MODEL = hub.load(yamnet_model_url)
+            logger.info("✓ YAMNet model loaded")
+        except Exception as e:
+            logger.error(f"Failed to load YAMNet: {e}")
+            raise HTTPException(status_code=503, detail=f"Could not load YAMNet model: {e}")
+    
     # Load audio at 16kHz (YAMNet's required sample rate)
     audio, sr = librosa.load(audio_path, sr=16000, duration=max_duration)
     audio = audio.astype(np.float32)
@@ -377,8 +401,8 @@ async def predict(file: UploadFile = File(...)):
     """
     global PREDICTION_COUNT
     
-    if MODEL is None or YAMNET_MODEL is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Classifier model not loaded. Please retrain the model first.")
     
     # Validate file type
     if not file.filename.endswith(('.wav', '.mp3', '.ogg', '.flac')):
